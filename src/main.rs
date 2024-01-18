@@ -8,6 +8,8 @@
 #![allow(async_fn_in_trait)]
 
 use core::fmt::Write;
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use cortex_m::interrupt::Mutex;
 use cortex_m::peripheral::syst::SystClkSource;
 use hal::clocks::ClocksManager;
 use hal::fugit::{HertzU32, RateExtU32};
@@ -38,6 +40,9 @@ const XTAL_FREQ_HZ: u32 = 12_000_000u32;
 
 const SYSTICK_RELOAD: u32 = 0x00FF_FFFF;
 
+static SYST_COUNT: AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static IRQ_FLAG_SYST: AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 const PLL_SYS_136MHZ: PLLConfig = PLLConfig {
     vco_freq: HertzU32::MHz(1100),
     refdiv: 1,
@@ -64,6 +69,9 @@ fn core1_task(mut in_pin: Pin<Gpio26, gpio::FunctionSioInput, PullUp>) -> () {
     core.SYST.set_reload(SYSTICK_RELOAD);
     core.SYST.clear_current();
     core.SYST.set_clock_source(SystClkSource::Core); // Sysclk
+    core.SYST.enable_counter();
+    // The first value we get will be garbage, so lets throw it away.
+    let mut syst_stable = false;
 
     // Unmask the IO_BANK0 IRQ so that the NVIC interrupt controller
     // will jump to the interrupt function when the interrupt occurs.
@@ -76,18 +84,20 @@ fn core1_task(mut in_pin: Pin<Gpio26, gpio::FunctionSioInput, PullUp>) -> () {
     let mut n_count: u8 = 0;
     let mut sum: u32 = 0;
     loop {
-        if !core.SYST.is_counter_enabled() {
-            // Timer has been stopped by interrupt
-            let count = cortex_m::peripheral::SYST::get_current();
-            if count != 0 && count < 0x00FFFF00 {
-                core.SYST.clear_current();
-                sum += count;
+        if IRQ_FLAG_SYST.load(Ordering::SeqCst) {
+            // Interrupt has occured
+            if syst_stable {
+                sum += SYST_COUNT.load(Ordering::Relaxed);
                 n_count += 1;
-                if n_count == 25 {
-                    sio.fifo.write_blocking(sum);
-                    n_count = 0;
-                    sum = 0;
-                }
+            } else {
+                syst_stable = true;
+            }
+            IRQ_FLAG_SYST.store(false, Ordering::SeqCst);
+
+            if n_count == 25 {
+                sio.fifo.write_blocking(sum);
+                n_count = 0;
+                sum = 0;
             }
         }
     }
@@ -194,12 +204,15 @@ fn IO_IRQ_BANK0() {
         }
         if int_src == 0x400u32 {
             // ensures that the interrupt comes from a low edge on GPIO26
-            let ptr = 0xE000E010u32 as *mut u32; // M0PLUS: SYST_CSR Register
+            let ptr = 0xE000E018u32 as *mut u32; // M0PLUS: SYST_CVR Register
             unsafe {
-                let syst_csr = ptr.read_volatile();
-                ptr.write(syst_csr ^ 0x1); // Toggle enable bit
+                let syst_cvr = ptr.read_volatile();
+                ptr.write(0); // Set Counter to 0
+                SYST_COUNT.store(syst_cvr, Ordering::SeqCst);
             }
+            IRQ_FLAG_SYST.store(true, Ordering::SeqCst);
         }
+
         let ptr = 0x400140FCu32 as *mut u32; // IO_BANK0: INTR3 Register
         unsafe {
             ptr.write(0xFFFFFFFFu32); // yolo all bits (Clear interrupt so we don't jump in this routine immidiatley again)
